@@ -1,15 +1,9 @@
-import { BaseNode, rc, ResultCode } from "blueshell";
+import { BaseNode, LatchedSequence, rc, ResultCode } from "blueshell";
 import EventEmitter from "events";
 import { AirSimAction, MissionState } from "./actions";
+import { MissionEvent } from "./events";
 
 const TICK_FREQ = 2; // Hz
-
-/**
- * Events emitted by MissonControl
- */
-export type MissionEvent = 'started' | 'stopping' | 'stopped';
-
-// todo: implement abort flow
 
 /**
  * Executor of a flight-plan. A behavior-tree is used to represent the flight-plan.
@@ -44,19 +38,19 @@ export class MissionControl {
    * @throws Error - When attempting to start MissionController that
    *  has already been started.
    */
-  start(): void {
-    if (this.isRunning() || (this.status && this.status !== rc.RUNNING)) {
+  launch(): void {
+    if (this.isActive() || (this.status && this.status !== rc.RUNNING)) {
       throw new Error('Mission already running');
     }
 
     this._status = rc.RUNNING;
-    this._eventEmitter.emit('started');
+    this.emit('launch', this.missionState);
     this._timer = 
       setInterval(() => {
-        if (this.shouldContinueMission()) {
-          this._status = this.mission.handleEvent(this.missionState,'tic');
+        if (!this.isComplete()) {
+          this._status = this.sendBTEvent(this.missionState,'tic');
         } else {
-          this.stop();
+          this.stopTic();
         }
       }, 1000 / TICK_FREQ);
   }
@@ -66,36 +60,91 @@ export class MissionControl {
    * terminated and no further 'tick' events are sent to the behavior-tree.
    * @returns The current status code if the controller has been started.
    */
-  stop(): ResultCode | undefined {
-    if (!this.status) {
+  abort() {
+    if (this.isActive()) {
+      this._status = this.sendBTEvent(this.missionState,'abort');
+      this.emit('abort', this.missionState);
+    } else if (!this.status) {
       console.log('Mission has not been started');
-    } else if (this.isRunning()) {
-      clearInterval(this._timer);
-      this._timer = undefined;
-      this._eventEmitter.emit('stopped');
+    } else if (this.isComplete()) {
+      console.log('Mission already completed.');
     }
-    return this.status;
   }
 
-  isRunning(): boolean {
+  private sendBTEvent(state: MissionState, event: MissionEvent): ResultCode {
+    return this.mission.handleEvent(state, event);
+  }
+
+  isActive(): boolean {
     return !!this._timer;
   }
 
-  isStopped(): boolean {
-    return !this.isRunning();
-  }
-
-  shouldContinueMission(): boolean {
-    return !this.status ||
-      (this.status === rc.RUNNING &&
-       !this.missionState.errorReason);  
-  }
-
-  on(event: MissionEvent, listener: (...args: any[]) => void) {
-    return this._eventEmitter.on(event as string, listener);
+  isComplete(): boolean {
+    return (this.status ?? rc.RUNNING) !== rc.RUNNING;  
   }
 
   get status(): ResultCode | undefined{
     return this._status;
+  }
+
+  protected stopTic() {
+    clearInterval(this._timer);
+    this._timer = undefined;
+    this.emit('complete', this.missionState);
+  }
+
+  on(event: MissionEvent, listener: (state: MissionState) => void) {
+    return this._eventEmitter.on(event, listener);
+  }
+
+  protected emit(event: MissionEvent, state: MissionState) {
+    this._eventEmitter.emit(event, state);
+  }
+
+  removeListener(event: MissionEvent, listener: (state: MissionState) => void) {
+    return this._eventEmitter.removeListener(event, listener);
+  }
+}
+
+
+/**
+ * A latched sequence of AirSim actions that make up a flight plan. 
+ * If at any point a child node of this sequence fails, the 
+ * sequence will always fail hereafter. This behavior forces
+ * an aborted flight plan to procedue to the mission's
+ * abort procedure.
+ */
+ export class FlightPlanSequence extends LatchedSequence<MissionState, MissionEvent> {
+
+  private aborted = false;
+
+  constructor(name: string, actions: AirSimAction[]) {
+    super(name, actions);
+  }
+
+  handleEvent(state: MissionState, event: MissionEvent) {
+    if (event === 'abort') {
+      this.aborted = true;
+    }
+
+    return super.handleEvent(state, event);
+  }
+
+  /**
+   * Return true if this Node should proceed handling the event. false otherwise.
+   * @param state
+   * @param event
+   */
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  protected precondition(state: MissionState, event: MissionEvent): boolean {
+    return !this.isAborted();
+  }
+
+  protected _afterEvent(res: ResultCode, state: MissionState, event: MissionEvent): ResultCode {
+    return super._afterEvent(this.isAborted() ? rc.FAILURE : res, state, event);
+  }
+
+  isAborted(): boolean {
+    return this.aborted;
   }
 }

@@ -1,31 +1,34 @@
 import { AirSim, Multirotor, Vector3 } from 'airsim-js';
-import { LandAction, MissionState, MoveOnPathAction, MoveToPositionAction, 
-    MoveToZAction, ReturnHomeAction, StopMotorsAction, TakeoffAction } from './actions';
-import { rc, LatchedSelector, LatchedSequence, ResultCode } from 'blueshell';
-import { MissionControl, MissionEvent } from './mission-control';
+import {
+  CancelLastTaskAction,
+  HoverAction,
+  LandAction,
+  MissionState,
+  MoveToPositionAction, 
+  ReturnHomeAction,
+  RotateToYawAction,
+  StopMotorsAction,
+  TakeoffAction } from './actions';
+import { LatchedSequence, Selector } from 'blueshell';
+import { FlightPlanSequence, MissionControl } from './mission-control';
+import { MissionEvent } from './events';
 
 /**
  * The entry point for driving a drone mission setup, execution and teardown.
  * @returns a Promise<void> to await on 
  */
-async function main(): Promise<void> {
+export async function main(shouldAbort = false): Promise<void> {
   // Create airsim client and connect to a server. 
   // Assumes AirSim server is on localhost.
   const airsim = new AirSim(Multirotor);
   const connected = await airsim.connect();
   console.log('AirSim connection: ', connected ? 'ESTABLISHED' : 'FAILED');
-  if (!connected) {
-    console.log('Exiting');
-    process.exit(-1);
-  }
+  if (!connected) exit(-1);
 
   // verify server connectivity
   const ping = await airsim.ping();
   console.log(`AirSim ping: ${ping ? "SUCCESS" : "FAIL"}`);
-  if (!ping) {
-    console.log('Exiting');
-    process.exit(-1);
-  }
+  if (!ping) exit(-1);
 
   // Set airsim simulation to a clean initial state.
   // Don't assume simulation is ready to go by default.
@@ -51,53 +54,77 @@ async function main(): Promise<void> {
   missionState.debug = true;
 
   // Create the behavior tree for the flight plan.
-  let mission = new LatchedSelector<MissionState, string>(
+  let mission = new Selector<MissionState, string>(
     'Mission',
     [
       // A rectangular flight-plan.
-      new LatchedSequence<MissionState, string>(
+      new FlightPlanSequence(
         'FlightPlan',
         [
           new TakeoffAction('TakeoffAction', -2),
-          // new MoveToPositionAction('MoveToPosition1Action', new Vector3(80, 0, -1.5)),
-          // new MoveToPositionAction('MoveToPosition2Action', new Vector3(80, -125, -1.5)),
-          // new MoveToPositionAction('MoveToPosition3Action', new Vector3(0, -125, -5)),
-          new MoveOnPathAction(
-            'FlyPathAction',
-            [
-              new Vector3(80, 0, -1.5),    // side-1 of rectangle
-              new Vector3(80, -130, -1.5), // side-2 of rectangle
-              new Vector3(0, -130, -5)     // side-3 of rectangle
-            ]
-          ),
-          new ReturnHomeAction('ReturnHomeAction'),
-          new LandAction('LandAction'),
-          new StopMotorsAction('StopMotorsAction')
+
+          // leg-1
+          new MoveToPositionAction('MoveToPosition1', new Vector3(80, 0, -1.5)),
+          // leg-2
+          new RotateToYawAction('RotateTo270', 270, 1),
+          new MoveToPositionAction('MoveToPosition2', new Vector3(80, -125, -1.5)),
+          // leg-3
+          new RotateToYawAction('RotateTo180', 180, 1),
+          new MoveToPositionAction('MoveToPosition3', new Vector3(0, -125, -5)),
+          // leg-4
+          new RotateToYawAction('RotateTo90', 90, 1),
+          new ReturnHomeAction('ReturnHome'),
+          new HoverAction('Hover', 3),
+          new RotateToYawAction('Rotate0', 0, 1),
+
+          // Land and Stop
+          new LandAction('Land', 5),
+          new StopMotorsAction('StopMotors')
         ]),
       
       // Fallback plan when mission is aborted or an error occurs 
-      new LatchedSequence<MissionState, string>(
+      new LatchedSequence<MissionState, MissionEvent>(
         'AbortProcedure',
         [
-          new LandAction('LandAction'),
-          new StopMotorsAction('StopMotorsAction')
+          new CancelLastTaskAction('CancelLastTask'),
+          new HoverAction('Hover', 3),
+          new LandAction('Land', 5),
+          new StopMotorsAction('StopMotors')
         ])
     ]
   );
 
   // Create a mission controller with event listeners.
   let missionControl = new MissionControl('Mission', mission, missionState);
-  missionControl.on('started', () => console.log('Mission started'));
-  missionControl.on('stopped', () => {
+  missionControl.on('launch', () => console.log('Mission started'));
+  missionControl.on('complete', () => {
+    airsim.printLogMessage('MISSION: ', missionControl.status);
+    console.log('Mission status: ', missionControl.status);
+
     // close the connection to the server; no further commands will be transmitted
     airsim.close();
-
-    console.log('Mission status: ', missionControl.status);
     console.log('AirSim connection: CLOSED');
+    exit();
   });
 
   // Let's do it - launch the drone
-  missionControl.start();
+  missionControl.launch();
+
+  if (shouldAbort) {
+    setTimeout( () => {
+      console.log('MANUAL ABORT INITIATED');
+      missionControl.abort();
+    }, 5000);
+  }
 }
 
-main();
+function exit(exitCode = 0) {
+  console.log('Exiting');
+  process.exit(exitCode);
+}
+
+/**
+ * Start this program, create a mission and launch it.
+ * Optional CLI arg: 'abort' - causes mission to abort 5 seconds after launch
+ */
+main(process.argv.length > 2 && process.argv[2].toLowerCase() === 'abort');

@@ -1,6 +1,7 @@
 {
   "extends": "@tsconfig/node18",
   "compilerOptions": {
-    "outDir": "dist"
+    "outDir": "dist",
+    "sourceMap": true
   }
 }
